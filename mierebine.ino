@@ -1,5 +1,5 @@
-/**
- * MiereBine (Pardosilla) v 2022.1
+/*
+ * MiereBine (Pardosilla) v 2022.2
  * 
  * This little ESP8266 based device tries to solve the software issues
  * from Honeywell Evohome smart thermostat when used in conjuction the HCE80 underfloor heating controller
@@ -12,52 +12,70 @@
  * 
  */
 
+#include <Bounce2.h> // https://github.com/thomasfredericks/Bounce2
+#include <ESP8266TimerInterrupt.h> // https://github.com/khoih-prog/ESP8266TimerInterrupt
+#include <SimpleTimer.h> // https://playground.arduino.cc/Code/SimpleTimer/
+
 #include <WiFiManager.h> 
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
 #include <ESP8266mDNS.h>
-#include <SimpleTimer.h>
 #include <ArduinoOTA.h>
+
+// logging related includes
+#include <time.h>
+#include <CircularBuffer.h> // https://github.com/rlogiacco/CircularBuffer
+#include <ESP8266WebServer.h>
+
 #include "config.h"
 #include "config.local.h"
 
 #include "logging.h"
 
-// logging related includes
-#include <NTPClient.h>
-#include <WiFiUdp.h>
-#include <CircularBuffer.h>
-#include <ESP8266WebServer.h>
+// input relay is mechanical so we need to debounce it
+Bounce inputRelay = Bounce();
 
+// software timer
+SimpleTimer simpleTimer;
 volatile int timerId, maxOnTimeTimer;
 
+// hardware timer
+ESP8266Timer hwTimer;
+
+// network
 WiFiClient espClient;
+// servers
 PubSubClient mqtt(espClient);
-SimpleTimer simpleTimer;
 
 // Wifimanager variables
 WiFiManager wifiManager;
 bool portalRunning      = false;
 uint configPortalStartTime = millis();
 
-// time
-WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP);
-
 // logging
 ESP8266WebServer server(80);
 CircularBuffer<logRecord,300> logs;
 
+struct TStats {
+  time_t timeStarted;
+  unsigned int runs = 0;
+} stats;
+
 // ------------------------------------------------------------------------------------------
 
 void LOG(EventCode code) {
-   logs.push(logRecord{timeClient.getEpochTime(), code});
+  time_t tnow = time(nullptr);  
+  logs.push(logRecord{tnow, code});
 }
 
 // ------------------------------------------------------------------------------------------
 
 String formatRow(logRecord logRow) {
-  String text = (String)logRow.time + ",";
+  char buf[sizeof "fri 20 Jan 20:00:00"];
+  time_t now = time(&now);  
+  strftime(buf, sizeof buf, "%a %e %b %T", localtime(&logRow.time));
+  
+  String text = (String)buf + ",";
       
   switch (logRow.code) {
     case deviceOn:
@@ -131,7 +149,7 @@ void publishInputRelayStatus() {
 // ------------------------------------------------------------------------------------------
 
 bool isInputRelayOn() {
-  return !digitalRead(HCE80_RELAY_INPUT_PIN);
+  return inputRelay.read() == LOW;
 }
 
 // ------------------------------------------------------------------------------------------
@@ -147,7 +165,8 @@ void turnOn() {
   //maxOnTimeTimer = simpleTimer.setTimeout(MAX_ON_TIME, onRuntimeProtection);
   //lastOnTime = millis();
   LOG(EventCode::outputRelayOn);
-  publishOutputRelayStatus(); 
+  publishOutputRelayStatus();
+  stats.runs++; 
 }  
 
 // ------------------------------------------------------------------------------------------
@@ -167,23 +186,40 @@ void turnOff() {
 
 // ------------------------------------------------------------------------------------------
 
-ICACHE_RAM_ATTR void onRelayStatusChanged() {  
-  // remove the old timer to avoid triggering on/off
-  // if the source relay toggled before the timer interval  
-  simpleTimer.deleteTimer(timerId);
+void IRAM_ATTR hwTimerHandler()
+{
+  inputRelay.update(); 
   
-  if (isInputRelayOn()) {        
-    timerId = simpleTimer.setTimeout(RELAY_DELAY, turnOn);
-    LOG(EventCode::inputRelayOn);
+  if (inputRelay.changed()) {
+    
+    // remove the old timer to avoid triggering on/off
+    // if the source relay toggled before the timer interval  
+    
+    simpleTimer.deleteTimer(timerId);
+  
+    if (isInputRelayOn()) {
+      timerId = simpleTimer.setTimeout(RELAY_DELAY, turnOn);
+      LOG(EventCode::inputRelayOn);
+    } else {        
+      timerId = simpleTimer.setTimeout(RELAY_DELAY, turnOff);
+      LOG(EventCode::inputRelayOff);
+    }
+  
+    // move this outside of ISR
+    simpleTimer.setTimeout(50, onInputRelayChanged); 
+  }
+}
+
+// ------------------------------------------------------------------------------------------
+
+void onInputRelayChanged() {
+  if (isInputRelayOn()) {
     digitalWrite(LED_BUILTIN, LOW);
-  } else {        
-    timerId = simpleTimer.setTimeout(RELAY_DELAY, turnOff);
-    LOG(EventCode::inputRelayOff);
-    digitalWrite(LED_BUILTIN, HIGH);
+  } else {
+    digitalWrite(LED_BUILTIN, HIGH);   
   }
 
-  // move this outside of ISR
-  simpleTimer.setTimeout(10, publishInputRelayStatus);  
+  publishInputRelayStatus();
 }
 
 // ------------------------------------------------------------------------------------------
@@ -242,15 +278,52 @@ void setupWebserver() {
 
 // ------------------------------------------------------------------------------------------
 
+/*void onTimeUpdated() {
+  time_t tnow = time();
+  if (!stats.timeStarted) {
+    stats.timeStarted = tnow;
+  }
+}*/
+
+// ------------------------------------------------------------------------------------------
+
+void setupOTA() {
+  ArduinoOTA.begin();
+  ArduinoOTA.onStart([]() {
+    Serial.println("OTA firmware update started");
+    hwTimer.disableTimer();
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("OTA Updated completed");
+    hwTimer.enableTimer();
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    hwTimer.enableTimer();
+    Serial.printf("Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) {
+      Serial.println("Auth Failed");
+    } else if (error == OTA_BEGIN_ERROR) {
+      Serial.println("Begin Failed");
+    } else if (error == OTA_CONNECT_ERROR) {
+      Serial.println("Connect Failed");
+    } else if (error == OTA_RECEIVE_ERROR) {
+      Serial.println("Receive Failed");
+    } else if (error == OTA_END_ERROR) {
+      Serial.println("End Failed");
+    }
+  });
+}
+
+// ------------------------------------------------------------------------------------------
+
 void setup() {    
   pinMode(BOILER_RELAY_PIN, OUTPUT);    
   pinMode(LED_BUILTIN, OUTPUT);    
   digitalWrite(LED_BUILTIN, HIGH); // turn off
   digitalWrite(BOILER_RELAY_PIN, HIGH); // turn off
-  pinMode(HCE80_RELAY_INPUT_PIN, INPUT_PULLUP);
-  pinMode(CONFIG_PORTAL_PIN, INPUT_PULLUP);  
-  
-  attachInterrupt(digitalPinToInterrupt(HCE80_RELAY_INPUT_PIN), onRelayStatusChanged, CHANGE);    
+  inputRelay.attach(HCE80_RELAY_INPUT_PIN, INPUT_PULLUP);
+  inputRelay.interval(INPUT_RELAY_DEBOUNCE);
+  pinMode(CONFIG_PORTAL_PIN, INPUT_PULLUP);
 
   WiFi.mode(WIFI_STA); // explicitly set mode, esp defaults to STA+AP  
   wifi_set_sleep_type(LIGHT_SLEEP_T);
@@ -262,27 +335,34 @@ void setup() {
   wifiManager.setHostname(HOSTNAME);
   wifiManager.setWiFiAutoReconnect(true);
   wifiManager.setConnectTimeout(30);
-  wifiManager.setEnableConfigPortal(false);
+  //wifiManager.setEnableConfigPortal(false);
   wifiManager.autoConnect();
 
   // must be before logging starts
-  timeClient.begin();
+  configTime(TIME_TZ, TIME_NTP_SERVER); 
+  //settimeofday_cb(onTimeUpdated);
 
   LOG(EventCode::deviceOn);
 
   mqtt.setServer(mqttBroker, mqttPort);
   mqtt.setKeepAlive(MQTT_KEEP_ALIVE_SEC);
   ensureMqttConnected();
-  
+
+  // the hardware timer is used to safely capture the input relay changes  
+  // hardware timer interval is expressed in nano seconds, but constant is in ms
+  // leave this interrupt setup after wifi and mqtt
+  hwTimer.attachInterruptInterval(HW_TIMER_INTERVAL * 1000, hwTimerHandler); 
+
   if (isInputRelayOn()) {
     turnOn();
   }
+  
   simpleTimer.setInterval(MQTT_WATCHDOG_INTERVAL, ensureMqttConnected);
   simpleTimer.setInterval(MQTT_HANDLING_INTERVAL, []() {mqtt.loop();});
   
   setupWebserver();
   
-  ArduinoOTA.begin();
+  setupOTA();
 }
 
 // ------------------------------------------------------------------------------------------
@@ -318,8 +398,6 @@ void loop() {
   simpleTimer.run();
   doWiFiManager();
   ArduinoOTA.handle();
-
   server.handleClient();
-  MDNS.update();
-  timeClient.update();  
+  MDNS.update();  
 }

@@ -27,3 +27,18 @@ So, to actually make some use out of this setup, I needed to fix the damn relay 
 - if the on interval is less than the minimum allowed (RELAY_DELAY) do not even bother to start the relay
 - if the source relay has switched on again during our wait we can keep the relay on
 - stop the boiler relay after x hours of constant runtime as safeguard
+
+### Hardware
+
+- Any ESP8266 based board such as NodeMCU or Wemos D1
+- Mechanical relay module
+
+### Features
+- Configurable delay and timings
+- Using hardware ISR timer for the core switching function for safer/precise operations
+- On demand config portal for wifi settings
+- Publishes status to MQTT. Configurable MQTT connection watchdog.
+- Circular memory log with NTP time for last 300 events. Inspect the log using a http client
+- OTA firmware updates (signed)
+- mDNS host enabled
+

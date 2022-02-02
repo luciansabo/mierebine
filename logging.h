@@ -12,6 +12,6 @@ enum EventCode {
 };
 
 typedef struct {
-  unsigned long time;
+  time_t time;
   EventCode code;    
 } logRecord;
