@@ -24,13 +24,18 @@
 
 // logging related includes
 #include <time.h>
+#include <coredecls.h>                  // settimeofday_cb()
 #include <CircularBuffer.h> // https://github.com/rlogiacco/CircularBuffer
 #include <ESP8266WebServer.h>
+#include "logging.h"
 
+// app config
 #include "config.h"
 #include "config.local.h"
 
-#include "logging.h"
+#ifndef DEBUG
+#define Serial if(0)Serial
+#endif
 
 // input relay is mechanical so we need to debounce it
 Bounce inputRelay = Bounce();
@@ -131,7 +136,11 @@ void mqttPublish(const char *topic, const char *message) {
 
   if (!mqtt.publish(topic, message)) {
     LOG(EventCode::mqttPublishError);
-    Serial.print("MQTT Publish failed: " );
+    Serial.printf("MQTT Publish failed. Topic: " );
+    Serial.print(topic);
+    Serial.print(" Msg: ");
+    Serial.print(message);
+    Serial.print(" State: ");
     Serial.println(mqtt.state());
   }
 }
@@ -214,8 +223,10 @@ void IRAM_ATTR hwTimerHandler()
 
 void onInputRelayChanged() {
   if (isInputRelayOn()) {
+    Serial.println("Input relay on");  
     digitalWrite(LED_BUILTIN, LOW);
   } else {
+    Serial.println("Input relay off");  
     digitalWrite(LED_BUILTIN, HIGH);   
   }
 
@@ -226,15 +237,21 @@ void onInputRelayChanged() {
 
 void publishOutputRelayStatus() {
   if (isBoilerOn()) {
+    Serial.println("Output relay on");
     mqttPublish(outputRelayTopic, "{\"state\": \"ON\"}");
   } else {
+    Serial.println("Output relay off");
     mqttPublish(outputRelayTopic, "{\"state\": \"OFF\"}");    
   }
 }
 
 // ------------------------------------------------------------------------------------------
 
-void ensureMqttConnected() {    
+void ensureMqttConnected() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;      
+  }
+  
   if (mqtt.connected()) {    
     return;
   }
@@ -272,18 +289,27 @@ void setupWebserver() {
     }
   });
 
+  server.on("/status", []() {    
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send ( 200, "text/plain", "");
+    server.sendContent("Started (GMT): " + (String)ctime(&stats.timeStarted));
+    server.sendContent("Input relay: " + (String)(isInputRelayOn() ? "on" : "off") + "\n");
+    server.sendContent("Output relay: " + (String)(isBoilerOn() ? "on" : "off") + "\n");
+    server.sendContent("Runs: " + stats.runs);
+  });
+
   server.begin();
   Serial.println("Webserver started");
 }
 
 // ------------------------------------------------------------------------------------------
 
-/*void onTimeUpdated() {
-  time_t tnow = time();
+void onTimeUpdated() {
+  time_t tnow = time(nullptr);
   if (!stats.timeStarted) {
     stats.timeStarted = tnow;
   }
-}*/
+}
 
 // ------------------------------------------------------------------------------------------
 
@@ -334,13 +360,16 @@ void setup() {
   
   wifiManager.setHostname(HOSTNAME);
   wifiManager.setWiFiAutoReconnect(true);
-  wifiManager.setConnectTimeout(30);
-  //wifiManager.setEnableConfigPortal(false);
+  wifiManager.setConnectTimeout(WIFI_CONNECT_TIMEOUT_SEC);
+  wifiManager.setEnableConfigPortal(false);
+  wifiManager.setConfigPortalBlocking(true);
+  wifiManager.setConfigPortalTimeout(CONFIG_PORTAL_TIMEOUT_SEC);
+  wifiManager.setSaveConfigCallback(saveConfigCallback);
   wifiManager.autoConnect();
 
   // must be before logging starts
   configTime(TIME_TZ, TIME_NTP_SERVER); 
-  //settimeofday_cb(onTimeUpdated);
+  settimeofday_cb(onTimeUpdated);
 
   LOG(EventCode::deviceOn);
 
@@ -368,36 +397,34 @@ void setup() {
 // ------------------------------------------------------------------------------------------
 
 void doWiFiManager(){
-  // is auto timeout portal running
-  if (portalRunning){
-    wifiManager.process(); // do processing
-
-    // check for timeout
-    if ((millis() - configPortalStartTime) > (CONFIG_PORTAL_TIMEOUT)){
-      Serial.println("Portal timeout");
-      portalRunning = false;      
-      wifiManager.stopConfigPortal();      
-   }
-  }
-
   // is configuration portal requested?
-  if (digitalRead(CONFIG_PORTAL_PIN) == LOW && (!portalRunning)) {
-    
+  if (digitalRead(CONFIG_PORTAL_PIN) == LOW) {
     Serial.println("Starting Config Portal");
-    wifiManager.setConfigPortalBlocking(false);
+    // important - disable webserver to be able to use the config portal routes
+    server.stop();    
+    // important - disable the hardware timer to avoid a brownout after save
+    hwTimer.disableTimer();
+    wifiManager.setEnableConfigPortal(true);
     wifiManager.startConfigPortal(CONFIG_PORTAL_AP_NAME, CONFIG_PORTAL_AP_PASS);
-          
-    portalRunning = true;
-    configPortalStartTime = millis();
+    wifiManager.setEnableConfigPortal(false);    
+    hwTimer.enableTimer();
+    server.begin();    
   }
 }
 
 // ------------------------------------------------------------------------------------------
 
-void loop() {      
-  simpleTimer.run();
-  doWiFiManager();
+void saveConfigCallback()
+{
+  Serial.println("Params saved");     
+}
+
+// ------------------------------------------------------------------------------------------
+
+void loop() {    
+  simpleTimer.run();  
   ArduinoOTA.handle();
   server.handleClient();
-  MDNS.update();  
+  MDNS.update();
+  doWiFiManager();
 }

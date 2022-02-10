@@ -1,3 +1,6 @@
+// comment/undef this to disable debugging
+#define DEBUG 1
+
 // Pins
 #define CONFIG_PORTAL_PIN       0
 #define BOILER_RELAY_PIN        4
@@ -15,7 +18,8 @@
 // Config portal
 #define CONFIG_PORTAL_AP_NAME   "MiereBine"
 #define CONFIG_PORTAL_AP_PASS   ""
-#define CONFIG_PORTAL_TIMEOUT   (10 * 60 * 1000) // 10 min
+#define CONFIG_PORTAL_TIMEOUT_SEC (10 * 60) // 10 min
+#define WIFI_CONNECT_TIMEOUT_SEC 30 // 30s
 
 // Other
 #define HOSTNAME                "MiereBine"
