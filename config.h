@@ -7,7 +7,7 @@
 #define HCE80_RELAY_INPUT_PIN   5
 
 // Timing
-#define RELAY_DELAY             (90 * 1000) // 90s in ms
+#define RELAY_DELAY             (120 * 1000) // 2m in ms
 #define INPUT_RELAY_DEBOUNCE    500 // ms
 #define MAX_ON_TIME             (6 * 3600 * 1000) // 6h in ms
 #define HW_TIMER_INTERVAL       10 // 10ms

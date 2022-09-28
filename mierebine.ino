@@ -66,6 +66,11 @@ struct TStats {
   unsigned int runs = 0;
 } stats;
 
+  char mqttBroker[100] = DEFAULT_MQTT_BROKER;
+  const char *outputRelayTopic = "saboiot/mierebine/outputRelay";
+  const char *inputRelayTopic = "saboiot/mierebine/inputRelay";
+  const char *availabilityTopic = "saboiot/mierebine/availability";
+
 // ------------------------------------------------------------------------------------------
 
 void LOG(EventCode code) {
@@ -260,7 +265,7 @@ void ensureMqttConnected() {
   
   Serial.print("Connecting to the mqtt broker... ");
   
-  if (!mqtt.connect(HOSTNAME, mqttUsername, mqttPassword, availabilityTopic, 0, true, "{\"status\": \"offline\"}"), true) {
+  if (!mqtt.connect(HOSTNAME, DEFAULT_MQTT_USERNAME, DEFAULT_MQTT_PASSWORD, availabilityTopic, 0, true, "{\"status\": \"offline\"}"), true) {
     Serial.print("connected");
     LOG(EventCode::mqttConnected);
     mqttPublish(availabilityTopic, "{\"status\": \"online\"}");
@@ -373,7 +378,7 @@ void setup() {
 
   LOG(EventCode::deviceOn);
 
-  mqtt.setServer(mqttBroker, mqttPort);
+  mqtt.setServer(mqttBroker, 1883);
   mqtt.setKeepAlive(MQTT_KEEP_ALIVE_SEC);
   ensureMqttConnected();
 
