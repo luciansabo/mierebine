@@ -16,16 +16,24 @@ The problem is that they sell actuators with much longer open time. It is somewh
 That 30s delay is not enough to open any actuator, but the boiler relay is triggered and it starts consuming has while no circuit is yet open.
 After 1m30s after the relay is triggered the actuators finally open, but we just wasted 1m30s worth of gas.
 The relay is stopped imediatally not with a delay, even if the still opened circuit could accept another minute of heat.
-This is of course a bug. I contacted Honeywell support and they failed to understand the issue
+
+When directly paired with HCE80 it does seem to proportionally open the actuators and start the boiler wnen the actuators start opening, but it does this even of shorter periods than the min on time.
+So you might not have heat demand but the HCE80 and BDR91 will be started. This leads of course to overshoot and short cycles (even less than 1 min).
+
+
+All these are of course a bugs. I contacted Honeywell support and they failed to understand the issue
 and insisted their device works properly even though it was really clear for me that they don't know exactly how it should behave. 
 They look at Evohome as some kind of magic device and insist that the TPI algorithm will finally "learn" the house. It doesn't. :)
 It is just nice hardware with crappy software.
 So, to actually make some use out of this setup, I needed to fix the damn relay and make it sync with my actuators.
 
 **Rules:**
-- start and stop boiler relay with a configurable delay (1m30s for Honeywell actuators works fine, because there is an extra 30s delay before relay fires)
-- if the on interval is less than the minimum allowed (RELAY_DELAY) do not even bother to start the relay
+- start and stop boiler relay with a configurable delay (2m for Honeywell actuators works fine, because there is an extra 30s delay before relay fires). The off delay is set to 1m30s
+- if the on interval is less than the minimum allowed (RELAY_ON_DELAY) do not even bother to start the boiler relay
 - if the source relay has switched on again during our wait we can keep the relay on
+- prevent the short cycles and overshoots by detecting that the source relay was working less than MIN_ON_TIME (set by default at 4m) in the MIN_ON_TIME_WINDOW (by default 15m). This protection kicks in after the first short cycle detected and is disabled after the first good cycle detected.
+A good cycle is either at least 4m in the last 15m or we had more than 15m since the last event
+- if the short cycle protection applies but a longer cycle is detected (double the MIN_ON_TIME - should be 8m), while the protection prevents the boiler relay from starting, we start the boiler
 - stop the boiler relay after x hours of constant runtime as safeguard
 
 ### Hardware
@@ -34,7 +42,8 @@ So, to actually make some use out of this setup, I needed to fix the damn relay 
 - Mechanical relay module
 
 ### Features
-- Configurable delay and timings
+- Makes Honeywell EvoHome work ... honey-well
+- Configurable delays and timings
 - Using hardware ISR timer for the core switching function for safer/precise operations
 - On demand config portal for wifi settings
 - Publishes status to MQTT. Configurable MQTT connection watchdog.

@@ -8,7 +8,8 @@ enum EventCode {
   mqttConnected,
   mqttConnectFrror,
   mqttPublishError,
-  maxRuntimeProtection
+  maxRuntimeProtection,
+  shortCycleDetected
 };
 
 typedef struct {

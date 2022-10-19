@@ -55,21 +55,24 @@ PubSubClient mqtt(espClient);
 // Wifimanager variables
 WiFiManager wifiManager;
 bool portalRunning      = false;
-uint configPortalStartTime = millis();
+ulong configPortalStartTime = millis();
 
 // logging
 ESP8266WebServer server(80);
 CircularBuffer<logRecord,300> logs;
 
+// on/off stats
+ulong lastInputRelayOnTime = 0, lastInputRelayOffTime = 0, lastGoodOffTime;
+
 struct TStats {
   time_t timeStarted;
-  unsigned int runs = 0;
+  ulong lastGoodOffTime = 0;
 } stats;
 
-  char mqttBroker[100] = DEFAULT_MQTT_BROKER;
-  const char *outputRelayTopic = "saboiot/mierebine/outputRelay";
-  const char *inputRelayTopic = "saboiot/mierebine/inputRelay";
-  const char *availabilityTopic = "saboiot/mierebine/availability";
+char mqttBroker[100] = DEFAULT_MQTT_BROKER;
+const char *outputRelayTopic = "saboiot/mierebine/outputRelay";
+const char *inputRelayTopic = "saboiot/mierebine/inputRelay";
+const char *availabilityTopic = "saboiot/mierebine/availability";
 
 // ------------------------------------------------------------------------------------------
 
@@ -118,6 +121,9 @@ String formatRow(logRecord logRow) {
     case maxRuntimeProtection:
       text += "maxRuntimeProtection";
       break;    
+    case shortCycleDetected:
+      text += "shortCycleDetected";
+      break;  
     default:
       text += "unknown";
       break;     
@@ -136,10 +142,10 @@ bool isBoilerOn() {
 
 // ------------------------------------------------------------------------------------------
 
-void mqttPublish(const char *topic, const char *message) {  
+void mqttPublish(const char *topic, const char *message, bool retain = false) {  
   ensureMqttConnected();
 
-  if (!mqtt.publish(topic, message)) {
+  if (!mqtt.publish(topic, message, retain)) {
     LOG(EventCode::mqttPublishError);
     Serial.printf("MQTT Publish failed. Topic: " );
     Serial.print(topic);
@@ -176,11 +182,10 @@ void onRuntimeProtection() {
 
 void turnOn() {  
   digitalWrite(BOILER_RELAY_PIN, LOW); // turn boiler relay on    
-  //maxOnTimeTimer = simpleTimer.setTimeout(MAX_ON_TIME, onRuntimeProtection);
-  //lastOnTime = millis();
+  //maxOnTimeTimer = simpleTimer.setTimeout(MAX_ON_TIME, onRuntimeProtection);  
   LOG(EventCode::outputRelayOn);
+  
   publishOutputRelayStatus();
-  stats.runs++; 
 }  
 
 // ------------------------------------------------------------------------------------------
@@ -192,9 +197,9 @@ void turnOff() {
     return;
   }
   
-  digitalWrite(BOILER_RELAY_PIN, HIGH); // turn boiler relay off    
-  //lastOffTime = millis();
+  digitalWrite(BOILER_RELAY_PIN, HIGH); // turn boiler relay off      
   LOG(EventCode::outputRelayOff);
+      
   publishOutputRelayStatus();  
 }
 
@@ -209,14 +214,37 @@ void IRAM_ATTR hwTimerHandler()
     // remove the old timer to avoid triggering on/off
     // if the source relay toggled before the timer interval  
     
-    simpleTimer.deleteTimer(timerId);
+    simpleTimer.deleteTimer(timerId);        
   
-    if (isInputRelayOn()) {
-      timerId = simpleTimer.setTimeout(RELAY_DELAY, turnOn);
-      LOG(EventCode::inputRelayOn);
-    } else {        
-      timerId = simpleTimer.setTimeout(RELAY_DELAY, turnOff);
-      LOG(EventCode::inputRelayOff);
+    if (isInputRelayOn()) {      
+      simpleTimer.setTimeout(100, [&lastInputRelayOnTime, &timerId]() {        
+        ulong currentTime = millis();
+        lastInputRelayOnTime = currentTime;
+
+        // if the last good cycle is not within the MIN_ON_TIME_WINDOW discard the current cycle
+        if ((currentTime - lastInputRelayOffTime) < MIN_ON_TIME_WINDOW && (currentTime - lastGoodOffTime) > MIN_ON_TIME_WINDOW) {
+          LOG(EventCode::shortCycleDetected);
+          timerId = simpleTimer.setTimeout(MIN_ON_TIME * 2, turnOn);          
+        } else {
+          timerId = simpleTimer.setTimeout(RELAY_ON_DELAY, turnOn);
+        }
+      });
+      
+    } else {     
+      simpleTimer.setTimeout(100, [&lastInputRelayOffTime, &lastGoodOffTime, &stats]() {
+        ulong currentTime = millis();
+        lastInputRelayOffTime = currentTime;
+        
+        // a "good" cycle has a minimum ON time
+        bool isGoodCycle = (currentTime - lastInputRelayOnTime) >= MIN_ON_TIME;
+        
+        if (isGoodCycle) {
+          lastGoodOffTime = currentTime;
+          stats.lastGoodOffTime = lastGoodOffTime;
+        }        
+      });
+
+      timerId = simpleTimer.setTimeout(RELAY_OFF_DELAY, turnOff);
     }
   
     // move this outside of ISR
@@ -229,9 +257,11 @@ void IRAM_ATTR hwTimerHandler()
 void onInputRelayChanged() {
   if (isInputRelayOn()) {
     Serial.println("Input relay on");  
+    LOG(EventCode::inputRelayOn);
     digitalWrite(LED_BUILTIN, LOW);
   } else {
     Serial.println("Input relay off");  
+    LOG(EventCode::inputRelayOff);
     digitalWrite(LED_BUILTIN, HIGH);   
   }
 
@@ -268,7 +298,7 @@ void ensureMqttConnected() {
   if (!mqtt.connect(HOSTNAME, DEFAULT_MQTT_USERNAME, DEFAULT_MQTT_PASSWORD, availabilityTopic, 0, true, "{\"status\": \"offline\"}"), true) {
     Serial.print("connected");
     LOG(EventCode::mqttConnected);
-    mqttPublish(availabilityTopic, "{\"status\": \"online\"}");
+    mqttPublish(availabilityTopic, "{\"status\": \"online\"}", true);
     publishInputRelayStatus();
     publishOutputRelayStatus();
   } else {
@@ -296,11 +326,12 @@ void setupWebserver() {
 
   server.on("/status", []() {    
     server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-    server.send ( 200, "text/plain", "");
+    server.send (200, "text/plain", "");
     server.sendContent("Started (GMT): " + (String)ctime(&stats.timeStarted));
     server.sendContent("Input relay: " + (String)(isInputRelayOn() ? "on" : "off") + "\n");
     server.sendContent("Output relay: " + (String)(isBoilerOn() ? "on" : "off") + "\n");
-    server.sendContent("Runs: " + stats.runs);
+    server.sendContent("Last good cycle off time: " +
+      (String)((String)((millis() - stats.lastGoodOffTime) / 60000) + " minutes ago"));
   });
 
   server.begin();
@@ -386,6 +417,8 @@ void setup() {
   // hardware timer interval is expressed in nano seconds, but constant is in ms
   // leave this interrupt setup after wifi and mqtt
   hwTimer.attachInterruptInterval(HW_TIMER_INTERVAL * 1000, hwTimerHandler); 
+  lastGoodOffTime = millis();
+  stats.lastGoodOffTime = lastGoodOffTime;
 
   if (isInputRelayOn()) {
     turnOn();
