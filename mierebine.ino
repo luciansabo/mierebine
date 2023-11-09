@@ -136,8 +136,8 @@ String formatRow(logRecord logRow) {
 
 // ------------------------------------------------------------------------------------------
 
-bool isBoilerOn() {
-  return !digitalRead(BOILER_RELAY_PIN);
+bool isBoilerOn() {  
+  return !digitalRead(BOILER_RELAY_PIN);  
 }
 
 // ------------------------------------------------------------------------------------------

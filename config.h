@@ -2,7 +2,7 @@
 #define DEBUG 1
 
 // Pins
-#define CONFIG_PORTAL_PIN       0
+#define CONFIG_PORTAL_PIN       1
 #define BOILER_RELAY_PIN        4
 #define HCE80_RELAY_INPUT_PIN   5
 
