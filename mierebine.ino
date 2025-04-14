@@ -15,19 +15,14 @@
 #include <Bounce2.h> // https://github.com/thomasfredericks/Bounce2
 #include <ESP8266TimerInterrupt.h> // https://github.com/khoih-prog/ESP8266TimerInterrupt
 #include <SimpleTimer.h> // https://playground.arduino.cc/Code/SimpleTimer/
-
 #include <WiFiManager.h> 
+#include <TelnetStream.h>
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
 #include <ESP8266mDNS.h>
 #include <ArduinoOTA.h>
-
-// logging related includes
 #include <time.h>
 #include <coredecls.h>                  // settimeofday_cb()
-#include <CircularBuffer.h> // https://github.com/rlogiacco/CircularBuffer
-#include <ESP8266WebServer.h>
-#include "logging.h"
 
 // app config
 #include "config.h"
@@ -57,9 +52,7 @@ WiFiManager wifiManager;
 bool portalRunning      = false;
 ulong configPortalStartTime = millis();
 
-// logging
-ESP8266WebServer server(80);
-CircularBuffer<logRecord,300> logs;
+volatile bool hasExternalHeatDemand = false, hasInternalHeatDemand = false;
 
 // on/off stats
 ulong lastInputRelayOnTime = 0, lastInputRelayOffTime = 0, lastGoodOffTime;
@@ -76,66 +69,6 @@ const char *availabilityTopic = "saboiot/mierebine/availability";
 
 // ------------------------------------------------------------------------------------------
 
-void LOG(EventCode code) {
-  time_t tnow = time(nullptr);  
-  logs.push(logRecord{tnow, code});
-}
-
-// ------------------------------------------------------------------------------------------
-
-String formatRow(logRecord logRow) {
-  char buf[sizeof "fri 20 Jan 20:00:00"];
-  time_t now = time(&now);  
-  strftime(buf, sizeof buf, "%a %e %b %T", localtime(&logRow.time));
-  
-  String text = (String)buf + ",";
-      
-  switch (logRow.code) {
-    case deviceOn:
-      text += "deviceOn";
-      break;
-    case inputRelayOn:
-      text += "inputRelayOn";
-      break;
-    case inputRelayOff:
-      text += "inputRelayOff";
-      break;
-    case outputRelayOn:
-      text += "outputRelayOn";
-      break;
-    case outputRelayOff:
-      text += "outputRelayOff";
-      break;      
-    case mqttDisconnected:
-      text += "mqttDisconnected";
-      break;     
-    case mqttConnected:
-      text += "mqttConnected";
-      break;    
-    case mqttConnectFrror:
-      text += "mqttConnectFrror";
-      break;     
-    case mqttPublishError:
-      text += "mqttPublishError";
-      break;     
-    case maxRuntimeProtection:
-      text += "maxRuntimeProtection";
-      break;    
-    case shortCycleDetected:
-      text += "shortCycleDetected";
-      break;  
-    default:
-      text += "unknown";
-      break;     
-  }
-
-  text += "\n";
-
-  return text;
-}
-
-// ------------------------------------------------------------------------------------------
-
 bool isBoilerOn() {  
   return !digitalRead(BOILER_RELAY_PIN);  
 }
@@ -145,8 +78,7 @@ bool isBoilerOn() {
 void mqttPublish(const char *topic, const char *message, bool retain = false) {  
   ensureMqttConnected();
 
-  if (!mqtt.publish(topic, message, retain)) {
-    LOG(EventCode::mqttPublishError);
+  if (!mqtt.publish(topic, message, retain)) {    
     Serial.printf("MQTT Publish failed. Topic: " );
     Serial.print(topic);
     Serial.print(" Msg: ");
@@ -175,30 +107,47 @@ bool isInputRelayOn() {
 // ------------------------------------------------------------------------------------------
 
 void onRuntimeProtection() {  
-  turnOff();  
-  LOG(EventCode::maxRuntimeProtection);
+  turnOff();    
 }
 // ------------------------------------------------------------------------------------------
 
-void turnOn() {  
+void turnOn(int origin = 0) {
+  if (origin == 0) {
+    hasInternalHeatDemand = true;
+  }
   digitalWrite(BOILER_RELAY_PIN, LOW); // turn boiler relay on    
-  //maxOnTimeTimer = simpleTimer.setTimeout(MAX_ON_TIME, onRuntimeProtection);  
-  LOG(EventCode::outputRelayOn);
+  //maxOnTimeTimer = simpleTimer.setTimeout(MAX_ON_TIME, onRuntimeProtection);    
   
   publishOutputRelayStatus();
 }  
 
+void openActuator() {
+  digitalWrite(ACTUATOR_RELAY_PIN, LOW);
+}
+
+void closeActuator() {
+  digitalWrite(ACTUATOR_RELAY_PIN, HIGH);
+}
+
+
 // ------------------------------------------------------------------------------------------
 
 void turnOff() {
-  //simpleTimer.deleteTimer(maxOnTimeTimer);  
-   
-  if (!isBoilerOn()) {
+  //simpleTimer.deleteTimer(maxOnTimeTimer);    
+
+  if (hasExternalHeatDemand) {
+    TelnetStream.println("Boiler has external heat demand. Ignoring turn off");
     return;
   }
+   
+  if (!isBoilerOn()) {
+    TelnetStream.println("Boiler is not on. Ignoring turn off");
+    return;
+  }
+
+  TelnetStream.println("Turn boiler off");
   
-  digitalWrite(BOILER_RELAY_PIN, HIGH); // turn boiler relay off      
-  LOG(EventCode::outputRelayOff);
+  digitalWrite(BOILER_RELAY_PIN, HIGH); // turn boiler relay off        
       
   publishOutputRelayStatus();  
 }
@@ -217,21 +166,20 @@ void IRAM_ATTR hwTimerHandler()
     simpleTimer.deleteTimer(timerId);        
   
     if (isInputRelayOn()) {      
-      simpleTimer.setTimeout(100, [&lastInputRelayOnTime, &timerId]() {        
+      simpleTimer.setTimeout(100, []() {        
         ulong currentTime = millis();
         lastInputRelayOnTime = currentTime;
 
         // if the last good cycle is not within the MIN_ON_TIME_WINDOW discard the current cycle
-        if ((currentTime - lastInputRelayOffTime) < MIN_ON_TIME_WINDOW && (currentTime - lastGoodOffTime) > MIN_ON_TIME_WINDOW) {
-          LOG(EventCode::shortCycleDetected);
-          timerId = simpleTimer.setTimeout(MIN_ON_TIME * 2, turnOn);          
+        if ((currentTime - lastInputRelayOffTime) < MIN_ON_TIME_WINDOW && (currentTime - lastGoodOffTime) > MIN_ON_TIME_WINDOW) {          
+          timerId = simpleTimer.setTimeout(MIN_ON_TIME * 2, []() {turnOn();} );
         } else {
-          timerId = simpleTimer.setTimeout(RELAY_ON_DELAY, turnOn);
+          timerId = simpleTimer.setTimeout(RELAY_ON_DELAY, []() {turnOn();} );
         }
       });
       
     } else {     
-      simpleTimer.setTimeout(100, [&lastInputRelayOffTime, &lastGoodOffTime, &stats]() {
+      simpleTimer.setTimeout(100, []() {
         ulong currentTime = millis();
         lastInputRelayOffTime = currentTime;
         
@@ -256,12 +204,10 @@ void IRAM_ATTR hwTimerHandler()
 
 void onInputRelayChanged() {
   if (isInputRelayOn()) {
-    Serial.println("Input relay on");  
-    LOG(EventCode::inputRelayOn);
+    TelnetStream.println("Input relay on");      
     digitalWrite(LED_BUILTIN, LOW);
   } else {
-    Serial.println("Input relay off");  
-    LOG(EventCode::inputRelayOff);
+    TelnetStream.println("Input relay off");      
     digitalWrite(LED_BUILTIN, HIGH);   
   }
 
@@ -272,10 +218,10 @@ void onInputRelayChanged() {
 
 void publishOutputRelayStatus() {
   if (isBoilerOn()) {
-    Serial.println("Output relay on");
+    TelnetStream.println("Output relay on");
     mqttPublish(outputRelayTopic, "{\"state\": \"ON\"}");
   } else {
-    Serial.println("Output relay off");
+    TelnetStream.println("Output relay off");
     mqttPublish(outputRelayTopic, "{\"state\": \"OFF\"}");    
   }
 }
@@ -290,52 +236,21 @@ void ensureMqttConnected() {
   if (mqtt.connected()) {    
     return;
   }
-
-  LOG(EventCode::mqttDisconnected);
   
-  Serial.print("Connecting to the mqtt broker... ");
+  TelnetStream.print("Connecting to the mqtt broker... ");
   
-  if (!mqtt.connect(HOSTNAME, DEFAULT_MQTT_USERNAME, DEFAULT_MQTT_PASSWORD, availabilityTopic, 0, true, "{\"status\": \"offline\"}"), true) {
-    Serial.print("connected");
-    LOG(EventCode::mqttConnected);
+  if (mqtt.connect(HOSTNAME, DEFAULT_MQTT_USERNAME, DEFAULT_MQTT_PASSWORD, availabilityTopic, 0, true, "{\"status\": \"offline\"}"), true) {
+    TelnetStream.print("connected");    
     mqttPublish(availabilityTopic, "{\"status\": \"online\"}", true);
+    mqtt.subscribe("saboiot/mierebine/actuator");
+    mqtt.subscribe("saboiot/mierebine/boiler");
     publishInputRelayStatus();
     publishOutputRelayStatus();
-  } else {
-    LOG(EventCode::mqttConnectFrror);
-    Serial.print("failed with state ");
-    Serial.print(mqtt.state()); 
+  } else {    
+    TelnetStream.print("failed with state ");
+    TelnetStream.print(mqtt.state()); 
   }
-  Serial.println("");
-}
-
-// ------------------------------------------------------------------------------------------
-
-void setupWebserver() {
-  MDNS.begin(HOSTNAME);
-  
-  // webserver for logging
-
-  server.on("/logs", []() {
-    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-    server.send ( 200, "text/plain", "");
-    for (int i = 0; i < logs.size(); i++) {      
-      server.sendContent(formatRow(logs[i]));      
-    }
-  });
-
-  server.on("/status", []() {    
-    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-    server.send (200, "text/plain", "");
-    server.sendContent("Started (GMT): " + (String)ctime(&stats.timeStarted));
-    server.sendContent("Input relay: " + (String)(isInputRelayOn() ? "on" : "off") + "\n");
-    server.sendContent("Output relay: " + (String)(isBoilerOn() ? "on" : "off") + "\n");
-    server.sendContent("Last good cycle off time: " +
-      (String)((String)((millis() - stats.lastGoodOffTime) / 60000) + " minutes ago"));
-  });
-
-  server.begin();
-  Serial.println("Webserver started");
+  TelnetStream.println("");
 }
 
 // ------------------------------------------------------------------------------------------
@@ -376,13 +291,45 @@ void setupOTA() {
   });
 }
 
+void mqttCallback(char* topic, byte* payload, unsigned int length) {  
+  char message[100];
+  strncpy(message, (char*)payload, length);
+  message[length] = '\0';
+
+  TelnetStream.print("Message arrived on topic:");
+  TelnetStream.println(topic);
+
+  if (String(topic) == "saboiot/mierebine/boiler") {
+    TelnetStream.print("Boiler:");
+    TelnetStream.println(message);    
+    
+    if (String(message) == "on") {
+      hasExternalHeatDemand = true;
+      turnOn(1);
+    } else {
+      hasExternalHeatDemand = false;
+      if (!hasInternalHeatDemand) {
+        turnOff();          
+      }
+    }
+  } else if (String(topic) == "saboiot/mierebine/actuator") {
+    TelnetStream.print("Actuator:");
+    TelnetStream.println(message);
+
+    String(message) == "on" ? openActuator() : closeActuator();
+  }
+   
+}
+
 // ------------------------------------------------------------------------------------------
 
 void setup() {    
   pinMode(BOILER_RELAY_PIN, OUTPUT);    
+  pinMode(ACTUATOR_RELAY_PIN, OUTPUT);    
   pinMode(LED_BUILTIN, OUTPUT);    
   digitalWrite(LED_BUILTIN, HIGH); // turn off
   digitalWrite(BOILER_RELAY_PIN, HIGH); // turn off
+  digitalWrite(ACTUATOR_RELAY_PIN, HIGH); // turn off  
   inputRelay.attach(HCE80_RELAY_INPUT_PIN, INPUT_PULLUP);
   inputRelay.interval(INPUT_RELAY_DEBOUNCE);
   pinMode(CONFIG_PORTAL_PIN, INPUT_PULLUP);
@@ -403,14 +350,17 @@ void setup() {
   wifiManager.setSaveConfigCallback(saveConfigCallback);
   wifiManager.autoConnect();
 
+  TelnetStream.begin();
+
   // must be before logging starts
   configTime(TIME_TZ, TIME_NTP_SERVER); 
   settimeofday_cb(onTimeUpdated);
 
-  LOG(EventCode::deviceOn);
+  MDNS.begin(HOSTNAME);
 
   mqtt.setServer(mqttBroker, 1883);
   mqtt.setKeepAlive(MQTT_KEEP_ALIVE_SEC);
+  mqtt.setCallback(mqttCallback);  
   ensureMqttConnected();
 
   // the hardware timer is used to safely capture the input relay changes  
@@ -427,8 +377,6 @@ void setup() {
   simpleTimer.setInterval(MQTT_WATCHDOG_INTERVAL, ensureMqttConnected);
   simpleTimer.setInterval(MQTT_HANDLING_INTERVAL, []() {mqtt.loop();});
   
-  setupWebserver();
-  
   setupOTA();
 }
 
@@ -438,15 +386,12 @@ void doWiFiManager(){
   // is configuration portal requested?
   if (digitalRead(CONFIG_PORTAL_PIN) == LOW) {
     Serial.println("Starting Config Portal");
-    // important - disable webserver to be able to use the config portal routes
-    server.stop();    
     // important - disable the hardware timer to avoid a brownout after save
     hwTimer.disableTimer();
     wifiManager.setEnableConfigPortal(true);
     wifiManager.startConfigPortal(CONFIG_PORTAL_AP_NAME, CONFIG_PORTAL_AP_PASS);
     wifiManager.setEnableConfigPortal(false);    
-    hwTimer.enableTimer();
-    server.begin();    
+    hwTimer.enableTimer(); 
   }
 }
 
@@ -461,8 +406,7 @@ void saveConfigCallback()
 
 void loop() {    
   simpleTimer.run();  
-  ArduinoOTA.handle();
-  server.handleClient();
+  ArduinoOTA.handle();  
   MDNS.update();
-  doWiFiManager();
+  //doWiFiManager();
 }

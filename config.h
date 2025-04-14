@@ -6,11 +6,13 @@
 #define BOILER_RELAY_PIN        4
 #define HCE80_RELAY_INPUT_PIN   5
 
+#define ACTUATOR_RELAY_PIN        14
+
 // Timing
 #define RELAY_ON_DELAY          (120 * 1000) // 2m in ms
 #define RELAY_OFF_DELAY         (90 * 1000) // 1m30s in ms
 #define INPUT_RELAY_DEBOUNCE    500 // ms
-#define MIN_ON_TIME             (4 * 60 * 1000) // 3m in ms
+#define MIN_ON_TIME             (4 * 60 * 1000) // 4m in ms
 #define MIN_ON_TIME_WINDOW      (15 * 60 * 1000) // 15m in ms
 #define MAX_ON_TIME             (6 * 3600 * 1000) // 6h in ms
 #define HW_TIMER_INTERVAL       10 // 10ms
